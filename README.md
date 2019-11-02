@@ -1,93 +1,60 @@
-Path MTU daemon
+Path MTU Discovery Daemon
 ===============
 
-With ECMP enabled the ICMP messages are routed mostly to wrong
-server. To fix that let's broadcast the ICMP messages that we think
-are worth it to every machine in colo. Some reading:
+## Overview
 
-  * https://tools.ietf.org/html/draft-jaeggli-v6ops-pmtud-ecmp-problem-00
+Devices behind VPN or other weird network links are unable to use [Path MTU Discovery](https://tools.ietf.org/html/rfc1191). This causes undesired fragmentation on the physical link between the device and the VPN endpoint.
+If we know (i.e. calculate) the overhead added by the encapsulation of the prococol we use, we can directly listen to IPv4 packets with the DF (Don't Forward) bit set and send back ICMP type 3 code 4 messages with the correct MTU.
+That is exaclty what PMTUDD (Path MTU Discovery Daemon) does.
 
+Note: The source code for this project is derived from CloudFlare's [pmtud](https://github.com/cloudflare/pmtud), according to the project's license. I am incredibly thankful to have found this codebase from which I could build upon.
+
+## Usage
 
 ```
-$ ./pmtud --help
+$ ./pmtudd --help
 
 Usage:
 
-    pmtud [options]
+    pmtudd [options]
 
-Path MTU Daemon is captures and broadcasts ICMP messages related to
-MTU detection. It listens on an interface, waiting for ICMP messages
-(IPv4 type 3 code 4 or IPv6 type 2 code 0) and it forwards them
-verbatim to the broadcast ethernet address.
+Path MTU Discovery Daemon listens for inbound IPv4 packets with the DF (Don't Fragment)
+bit set and sends back ICMP code 3 messages related to MTU detection
 
 Options:
 
   --iface              Network interface to listen on
-  --src-rate           Pps limit from single source (default=1.0 pss)
+  --src-rate           Pps limit from single source (default=1.1 pss)
   --iface-rate         Pps limit to send on a single interface (default=10.0 pps)
   --verbose            Print forwarded packets on screen
   --dry-run            Don't inject packets, just dry run
+  --desired-mtu        The MTU to send back link
   --cpu                Pin to particular cpu
-  --ports              Forward only ICMP packets with payload
-                       containing L4 source port on this list
-                       (comma separated)
   --help               Print this message
 
 Example:
 
-    pmtud --iface=eth2 --src-rate=1.0 --iface-rate=10.0
+    pmtudd --iface=eth2 --src-rate=1.1 --iface-rate=10.0 --desired-mtu=1420
 
 ```
 
-Once again, it listens waiting for packets matching:
-
-    ((icmp and icmp[0] == 3 and icmp[1] == 4) or
-      (icmp6 and ip6[40+0] == 2 and ip6[40+1] == 0)) and
-     (ether dst not ff:ff:ff:ff:ff:ff)
-
-And having appropriate length, and forwards them to ethernet broadcast
-ff:ff:ff:ff:ff:ff.
-
-To debug use tcpdump:
-
-    sudo tcpdump -s0 -e -ni eth0 '((icmp and icmp[0] == 3 and icmp[1] == 4) or
-                                   (icmp6 and ip6[40+0] == 2 and ip6[40+1] == 0))'
-
-
-To build type:
+## Building
 
     git submodule update --init --recursive
     make
 
+## Additional information
 
-To test run it in dry-run and verbose mode:
+pmtudd uses the following simple filter to match the approriate IPv4 packets:
 
-    sudo ./pmtud --iface=eth0 --dry-run -v -v -v
+    ip and ip[6] == 64 and greater {{MTU}}
 
+It then filters out possibly invalid/bogus packets and ignores packets which have the same src and dst MAC addresses (this prevents an attacker from performing DoS attacks).
+If the packet is valid, pmtudd crafts a new ICMP type 3 code 4 packet and sends it back to the address it received the original IPv4 packet from.
 
-If you want to use NFLOG interface:
+## Use case
 
-    iptables -I INPUT -i lo -p icmp -m icmp --icmp-type 3/4 --j NFLOG --nflog-group 33
-    ip6tables -I INPUT -i lo -p icmpv6 -m icmpv6 --icmpv6-type 2/0 -j NFLOG --nflog-group 33
+This was developped as a reponse to the issue of running hosts behind a VXLAN over Wireguard tunnel. The hosts used a default MTU of 1500 and were unable to detect the appropriate MTU to use.
+Using iptable rules on the wireless router to which they were connected in order to set the TCP MSS value was obviously not a good enough option and leaving all packets getting fragmented once sent on the physical link had a huge performance impact.
 
-You can add `-m pkttype ! --pkt-type broadcast` to be even more
-specific. Then to use the NFLOG api run:
-
-    sudo ./pmtud --iface=eth0 --dry-run -v -v -v --nflog 33
-
-This will cause `pmtud` to listen to packets from NFLOG and use `eth0`
-to brodcast them if neccesary. Debug by listing this /proc file:
-
-    cat /proc/net/netfilter/nfnetlink_log
-    33  32781     0 2 65535      0  1
-
-Where columns read:
-
- * nflog group number of a given queue (16 bits)
- * peer portid: most likely the pid of process
- * number of messages buffered on the kernel side
- * copy mode: 2 for full packet copy
- * copy range: max packet size
- * flush timeout in 1/100th of a second
- * use count
-
+This could be useful in all situations where devices connect to a network which forwards all packets through a VPN tunnel (be it IPSec, Wireguard, OpenVPN or any other) and where the physical MTU of the underlying network cannot be modified.

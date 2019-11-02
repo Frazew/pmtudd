@@ -15,7 +15,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 
-#include "pmtud.h"
+#include "pmtudd.h"
 
 pcap_t *setup_pcap(const char *iface, const char *bpf_filter, int snap_len,
 		   struct pcap_stat *stats)

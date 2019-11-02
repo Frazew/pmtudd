@@ -26,15 +26,15 @@ endif
 COPTS+=$(CFLAGS) $(COPTSDEBUG) $(COPTSWARN) $(COPTSSEC) -fPIE \
 	-Ideps/libpcap -I deps/libnfnetlink/include -Ideps/libnetfilter_log/include
 
-all: pmtud
+all: pmtudd
 
-pmtud: libpcap.a libnetfilter_log.a libnfnetlink.a src/*.c src/*.h Makefile
+pmtudd: libpcap.a libnetfilter_log.a libnfnetlink.a src/*.c src/*.h Makefile
 	$(CC) $(COPTS) \
 		src/main.c src/utils.c src/net.c src/uevent.c \
 		src/hashlimit.c src/csiphash.c src/sched.c \
 		./libpcap.a ./libnetfilter_log.a ./libnfnetlink.a \
 		$(LDOPTS) \
-		-o pmtud
+		-o pmtudd
 
 libpcap.a: deps/libpcap
 	(cd deps/libpcap && ./configure $(LIBPCAPOPTS) && make)
@@ -51,7 +51,7 @@ libnetfilter_log.a: deps/libnetfilter_log libnfnetlink.a
 	cp deps/libnetfilter_log/src/.libs/libnetfilter_log.a .
 
 clean:
-	rm -rf pmtud pmtud_*.deb
+	rm -rf pmtudd pmtudd_*.deb
 
 distclean: clean
 	rm -f lib*.a
@@ -107,9 +107,9 @@ cf-package:
 	@echo "[*] rebuilding"
 	-$(MAKE) clean
 	-$(MAKE) distclean
-	$(MAKE) pmtud BUILD=release CC=gcc
+	$(MAKE) pmtudd BUILD=release CC=gcc
 	-mkdir -p $(PACKAGE_ROOT)/$(BIN_PREFIX)
-	cp pmtud $(PACKAGE_ROOT)/$(BIN_PREFIX)
+	cp pmtudd $(PACKAGE_ROOT)/$(BIN_PREFIX)
 
 	fakeroot fpm -C $(PACKAGE_ROOT) \
 		-s dir \
@@ -117,6 +117,6 @@ cf-package:
 		--deb-compression bzip2 \
 		-v $(VERSION) \
 		--iteration $(ITERATION) \
-		-n pmtud \
+		-n pmtudd \
 		.
 	rm -rf $(PACKAGE_ROOT)

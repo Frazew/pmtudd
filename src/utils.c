@@ -13,7 +13,7 @@
 #include <sys/signalfd.h>
 #include <sys/time.h>
 
-#include "pmtud.h"
+#include "pmtudd.h"
 
 const char *optstring_from_long_options(const struct option *opt)
 {

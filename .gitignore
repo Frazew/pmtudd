@@ -1,8 +1,8 @@
 lib*.a
-pmtud
+pmtudd
 core
 tests/venv
-pmtud_*.deb
+pmtudd_*.deb
 .idea
 CMakeLists.txt
 cmake-build-debug

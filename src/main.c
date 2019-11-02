@@ -16,7 +16,7 @@
 #include <arpa/inet.h>
 
 #include "hashlimit.h"
-#include "pmtud.h"
+#include "pmtudd.h"
 #include "uevent.h"
 
 #define IFACE_RATE_PPS 10.0
@@ -27,9 +27,9 @@ static void usage()
 	fprintf(stderr,
 		"Usage:\n"
 		"\n"
-		"    pmtud [options]\n"
+		"    pmtudd [options]\n"
 		"\n"
-        "Path MTU Daemon listens for inbound IPv4 packets with the DF (Don't Fragment)\n"
+        "Path MTU Discovery Daemon listens for inbound IPv4 packets with the DF (Don't Fragment)\n"
         "bit set and sends back ICMP code 3 messages related to MTU detection\n"
 		"\n"
 		"Options:\n"
@@ -48,7 +48,7 @@ static void usage()
 		"\n"
 		"Example:\n"
 		"\n"
-		"    pmtud --iface=eth2 --src-rate=%.1f --iface-rate=%.1f --desired-mtu=1420\n"
+		"    pmtudd --iface=eth2 --src-rate=%.1f --iface-rate=%.1f --desired-mtu=1420\n"
 		"\n",
 		SRC_RATE_PPS, IFACE_RATE_PPS, SRC_RATE_PPS, IFACE_RATE_PPS);
 	exit(-1);
@@ -448,7 +448,7 @@ int main(int argc, char *argv[])
 	uevent_yield(&uevent, signal_desc(SIGTERM), UEVENT_READ, on_signal,
 		     (void *)&done);
 
-	fprintf(stderr, "[*] #%i Started pmtud ", getpid());
+	fprintf(stderr, "[*] #%i Started pmtudd ", getpid());
 	fprintf(stderr, "pcap on iface=%s ", str_quote(iface));
 
 	fprintf(stderr,
