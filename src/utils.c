@@ -43,6 +43,82 @@ const char *optstring_from_long_options(const struct option *opt)
 	return optstring;
 }
 
+/**
+  Returns the sum of the pairs of 2 bytes.
+ **/
+uint16_t add_checksum(const u_int8_t * buf, int length) {
+
+    int i;
+    uint16_t sum = 0, bytes;
+    for(i = 1; i< length; i += 2) {
+        bytes = (u_int8_t)buf[i] | ((u_int8_t)(buf[i - 1]) << 8);
+        sum += bytes;
+    }
+    return sum;
+}
+
+/* @TODO : This is absolutely UGLY */
+void build_packet(const struct icmp_packet * packet, u_int8_t **buf, int ip_payload_length, int packet_length) {
+    *buf = malloc(sizeof(u_int8_t) * packet_length);
+    int cursor = 0;
+
+    memcpy(*buf, packet->eth_dst, 6);
+    cursor += 6;
+
+    memcpy(&(*buf)[cursor], packet->eth_src, 6);
+    cursor += 6;
+
+    memcpy(&(*buf)[cursor], &packet->eth_type, 2);
+    cursor += 2;
+
+    memcpy(&(*buf)[cursor], &packet->ip_v_ihl, 1);
+    cursor += 1;
+
+    memcpy(&(*buf)[cursor], &packet->ip_tos, 1);
+    cursor += 1;
+
+    memcpy(&(*buf)[cursor], &packet->ip_length, 2);
+    cursor += 2;
+
+    memcpy(&(*buf)[cursor], &packet->ip_id, 2);
+    cursor += 2;
+
+    memcpy(&(*buf)[cursor], &packet->ip_flags_offset, 2);
+    cursor += 2;
+
+    memcpy(&(*buf)[cursor], &packet->ip_ttl, 1);
+    cursor += 1;
+
+    memcpy(&(*buf)[cursor], &packet->ip_proto, 1);
+    cursor += 1;
+
+    memcpy(&(*buf)[cursor], &packet->ip_chksum, 2);
+    cursor += 2;
+
+    memcpy(&(*buf)[cursor], packet->ip_src_addr, 4);
+    cursor += 4;
+
+    memcpy(&(*buf)[cursor], packet->ip_dst_addr, 4);
+    cursor += 4;
+
+    memcpy(&(*buf)[cursor], &packet->icmp_type, 1);
+    cursor += 1;
+
+    memcpy(&(*buf)[cursor], &packet->icmp_code, 1);
+    cursor += 1;
+
+    memcpy(&(*buf)[cursor], &packet->icmp_chksum, 2);
+    cursor += 2;
+
+    memcpy(&(*buf)[cursor], &packet->icmp_unused, 2);
+    cursor += 2;
+
+    memcpy(&(*buf)[cursor], &packet->icmp_mtu, 2);
+    cursor += 2;
+
+    memcpy(&(*buf)[cursor], packet->icmp_data, ip_payload_length);
+}
+
 int set_core_dump(int enable)
 {
 	struct rlimit limit;

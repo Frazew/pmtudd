@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 
 #include "hashlimit.h"
 #include "pmtud.h"
@@ -28,50 +29,33 @@ static void usage()
 		"\n"
 		"    pmtud [options]\n"
 		"\n"
-		"Path MTU Daemon is captures and broadcasts ICMP messages "
-		"related to\n"
-		"MTU detection. It listens on an interface, waiting for ICMP "
-		"messages\n"
-		"(IPv4 type 3 code 4 or IPv6 type 2 code 0) and it forwards "
-		"them\n"
-		"verbatim to the broadcast ethernet address.\n"
+        "Path MTU Daemon listens for inbound IPv4 packets with the DF (Don't Fragment)\n"
+        "bit set and sends back ICMP code 3 messages related to MTU detection\n"
 		"\n"
 		"Options:\n"
 		"\n"
 		"  --iface              Network interface to listen on\n"
-		"  --nflog              use given NFLOG group instead of pcap\n"
 		"  --src-rate           Pps limit from single source "
 		"(default=%.1f pss)\n"
 		"  --iface-rate         Pps limit to send on a single "
 		"interface "
 		"(default=%.1f pps)\n"
 		"  --verbose            Print forwarded packets on screen\n"
-		"  --strict             Forward only packets with MTU that\n"
-		"                       makes sense, between 576 and 1499\n"
-		"  --use-src            Use source MAC of original packet\n"
-		"                       as a src of forwarded packet\n"
 		"  --dry-run            Don't inject packets, just dry run\n"
+		"  --desired-mtu        The MTU to send back link\n"
 		"  --cpu                Pin to particular cpu\n"
-		"  --ports              Forward only ICMP packets with "
-		"payload\n"
-		"                       containing L4 source port on this "
-		"list\n"
-		"                       (comma separated)\n"
 		"  --help               Print this message\n"
 		"\n"
 		"Example:\n"
 		"\n"
-		"    pmtud --iface=eth2 --src-rate=%.1f --iface-rate=%.1f\n"
+		"    pmtud --iface=eth2 --src-rate=%.1f --iface-rate=%.1f --desired-mtu=1420\n"
 		"\n",
 		SRC_RATE_PPS, IFACE_RATE_PPS, SRC_RATE_PPS, IFACE_RATE_PPS);
 	exit(-1);
 }
 
 #define SNAPLEN 2048
-#define BPF_FILTER                                                             \
-	"((icmp and icmp[0] == 3 and icmp[1] == 4) or "                        \
-	" (icmp6 and ip6[40+0] == 2 and ip6[40+1] == 0)) and"                  \
-	"(ether dst not ff:ff:ff:ff:ff:ff)"
+#define BPF_FILTER "ip and ip[6] == 64 and greater %d"
 
 static int on_signal(struct uevent *uevent, int sfd, int mask, void *userdata)
 {
@@ -90,15 +74,12 @@ static int on_signal(struct uevent *uevent, int sfd, int mask, void *userdata)
 struct state
 {
 	pcap_t *pcap;
-	struct nflog *nflog;
 	int raw_sd;
 	struct hashlimit *sources;
 	struct hashlimit *ifaces;
 	int verbose;
 	int dry_run;
-	int strict;
-	int use_src;
-	uint64_t *ports_map;
+	uint16_t desired_mtu;
 };
 
 static int handle_packet(const uint8_t *p, unsigned data_len, void *userdata)
@@ -106,24 +87,27 @@ static int handle_packet(const uint8_t *p, unsigned data_len, void *userdata)
 	struct state *state = userdata;
 
 	const char *reason = "unknown";
-	int mtu_of_next_hop = -1;
 	int l4_sport = -1;
 
 	/* assumming DLT_EN10MB */
 
-	/* 14 ethernet, 20 ipv4, 8 icmp, 8 IPv4 on payload */
-	if (data_len < 14 + 20 + 8 + 8) {
-		return -1;
+	/* 14 ethernet plus the maximum MTU */
+	if (data_len < 14 + state->desired_mtu) {
+		reason = "Packet size within bounds";
+		goto reject;
 	}
 
-	if (p[0] == 0xff && p[1] == 0xff && p[2] == 0xff && p[3] == 0xff &&
-	    p[4] == 0xff && p[5] == 0xff) {
-		return -1;
-	}
+	/* Check whether we're being tricked, we never known */
+	/*if (p[0] == p[6] && p[1] == p[7] && p[2] == p[8] && p[3] == p[9] &&
+	    p[4] == p[10] && p[5] == p[11]) {
+        reason = "Invalid Ethernet header";
+        goto reject;
+	}*/
 
 	const uint8_t *hash = NULL;
 	int hash_len = 0;
 
+	/* Check whether the packet has a VLAN tag */
 	unsigned l3_offset = 14;
 	uint16_t eth_type = (((uint16_t)p[12]) << 8) | (uint16_t)p[13];
 	if (eth_type == 0x8100) {
@@ -131,132 +115,110 @@ static int handle_packet(const uint8_t *p, unsigned data_len, void *userdata)
 		l3_offset = 18;
 	}
 
-	unsigned icmp_offset = 0;
 	int valid = 0;
+    int l3_hdr_len = 0;
+
+	/* Handle an IPv4 packet */
 	if (eth_type == 0x0800 && (p[l3_offset] & 0xF0) == 0x40) {
-		int l3_hdr_len = (int)(p[l3_offset] & 0x0F) * 4;
-		if (l3_hdr_len < 20) {
+		l3_hdr_len = (int)(p[l3_offset] & 0x0F) * 4;
+		if (l3_hdr_len < 20 || l3_hdr_len > 24) {
 			reason = "IPv4 header invalid length";
 			goto reject;
 		}
-		icmp_offset = l3_offset + l3_hdr_len;
 
-		uint8_t protocol = p[l3_offset + 9];
-		/* header: 20 bytes of IPv4, 8 bytes of ICMP,
-		 * payload: 20 bytes of IPv4, 8 bytes of TCP */
-		if (protocol == 1 && data_len >= l3_offset + 20 + 8 + 20 + 8) {
-			valid = 1;
-			hash = &p[l3_offset + 12];
-			hash_len = 4;
+		/* Flags : R, DF, MF. We want DF = 1 and the others = 0 */
+		if ((p[l3_offset + 6] & 0xE0) == 0x40) {
+            valid = 1;
+            hash = &p[l3_offset + 12];
+            hash_len = 4;
 		}
 	}
 
+    /* Handle an IPv6 packet : do not send anything back */
 	if (eth_type == 0x86dd && (p[l3_offset] & 0xF0) == 0x60) {
-		icmp_offset = l3_offset + 40;
-
-		uint8_t protocol = p[l3_offset + 6];
-		/* header, 40 bytes of IPv6, 8 bytes of ICMP
-		 * payload: 32 bytes of IPv6 payload */
-		if (protocol == 58 && data_len >= l3_offset + 40 + 8 + 32) {
-			valid = 1;
-			hash = &p[l3_offset + 8];
-			hash_len = 16;
-		}
+		reason = "IPv6 is not supported";
+        goto reject;
 	}
 
-	if (valid == 0 || hash == NULL || hash_len == 0 || icmp_offset == 0) {
-		reason = "Invalid protocol or too short";
+	if (valid == 0 || hash == NULL || hash_len == 0) {
+		reason = "Invalid IP packet or DF not set";
 		goto reject;
 	}
 
-	if (data_len < icmp_offset + 8) {
-		reason = "Packet too short";
-		goto reject;
-	}
+	/* Forge our new ICMP reply packet */
+	struct icmp_packet *packet = malloc(sizeof(struct icmp_packet));
 
-	if (eth_type == 0x0800 && p[icmp_offset] == 3 &&
-	    p[icmp_offset + 1] == 4) {
-		mtu_of_next_hop = ((uint16_t)p[icmp_offset + 6] << 8) |
-				  ((uint16_t)p[icmp_offset + 7]);
-	}
-	if (eth_type == 0x86dd && p[icmp_offset] == 2 &&
-	    p[icmp_offset + 1] == 0) {
-		mtu_of_next_hop = ((uint32_t)p[icmp_offset + 4] << 24) |
-				  ((uint32_t)p[icmp_offset + 5] << 16) |
-				  ((uint32_t)p[icmp_offset + 6] << 8) |
-				  ((uint32_t)p[icmp_offset + 7]);
-	}
-
-	if (mtu_of_next_hop != -1) {
-		/* Are we talking about PMTU icmp at all? */
-		if (mtu_of_next_hop < 68 || mtu_of_next_hop > 16384) {
-			reason = "MTU of next hop is stupid";
-			goto reject;
-		}
-
-		if (state->strict &&
-		    (mtu_of_next_hop < 576 || mtu_of_next_hop >= 1500)) {
-			reason = "MTU of next hop looks bogus";
-			goto reject;
-		}
-	}
-
-	if (state->ports_map) {
-		unsigned payload_offset = icmp_offset + 8;
-		if (data_len < payload_offset + 1) {
-			reason = "Payload too short";
-			goto reject;
-		}
-
-		/* Optimistic parsing: ignore protocol field in ICMP
-		 * payload, ignore IP length, etc. */
-		unsigned l4_offset = 0;
-		switch (p[payload_offset] & 0xF0) {
-		case 0x40:
-			l4_offset = payload_offset +
-				    (int)(p[payload_offset] & 0x0F) * 4;
-			break;
-		case 0x60:
-			l4_offset = payload_offset + 40;
-			break;
-		default:
-			reason = "Invalid ICMP payload";
-			goto reject;
-		}
-
-		if (data_len < l4_offset + 2) {
-			reason = "Too short to read L4 source port";
-			goto reject;
-		}
-		l4_sport = ((uint16_t)p[l4_offset] << 8) |
-			   ((uint16_t)p[l4_offset + 1]);
-		if (bitmap_get(state->ports_map, l4_sport) == 0) {
-			reason = "L4 source port not on whitelist";
-			goto reject;
-		}
-	}
-
-	uint8_t src_mac[6];
-	if (state->use_src == 1) {
-	  // Use src of original pkt as a src_mac for forwarded pkt
-	  // Used when pmtud is running on a router that sends PMTU pkts
-	  memcpy(src_mac, p+6, 6);
-	} else {
-	  // Use dst of original pkt as a src_mac for forwarded pkt
-	  // Used when pmtud is running on a lbs that receives PMTU pkts
-	  memcpy(src_mac, p, 6);
-	}
-	/* alright, write there anyway */
-	uint8_t *pp = (uint8_t *)p;
-
+	/* Set the MAC src and dst addresses */
 	int i;
 	for (i = 0; i < 6; i++) {
-		pp[i] = 0xff;
+        packet->eth_dst[i] = p[6 + i];
 	}
 
 	for (i = 0; i < 6; i++) {
-		pp[6 + i] = src_mac[i];
+        packet->eth_src[i] = p[i];
 	}
+	packet->eth_type = 0x0008;
+
+	uint16_t ip_chksum = 0;
+
+	packet->ip_v_ihl = (0x04 << 4) | 0x05;
+	packet->ip_tos = 0x00;
+    ip_chksum += (packet->ip_v_ihl << 8) | packet->ip_tos;
+
+	packet->ip_id = 0x0000;
+	packet->ip_flags_offset = 0x0000;
+
+	packet->ip_ttl = (u_int8_t )0x40;
+	packet->ip_proto = (u_int8_t )0x01;
+    ip_chksum += (packet->ip_ttl << 8) | packet->ip_proto;
+
+	packet->ip_chksum = 0x0000;
+
+	/* Set the IP src and dst addresses */
+    for (i = 0; i < 4; i ++) {
+        packet->ip_src_addr[i] = p[l3_offset + 12 + 4 + i];
+    }
+    ip_chksum += add_checksum(packet->ip_src_addr, 4);
+
+	for (i = 0; i < 4; i ++) {
+        packet->ip_dst_addr[i] = p[l3_offset + 12 + i];
+	}
+    ip_chksum += add_checksum(packet->ip_dst_addr, 4);
+
+    uint16_t icmp_chksum = 0;
+
+    packet->icmp_type = (u_int8_t )0x3;
+    packet->icmp_code = (u_int8_t )0x4;
+    icmp_chksum += ((uint16_t)packet->icmp_type << 8) | (uint16_t)packet->icmp_code;
+
+    packet->icmp_chksum = 0x0000;
+    packet->icmp_unused = 0x0000;
+    packet->icmp_mtu = htons(state->desired_mtu);
+    icmp_chksum += (uint16_t)state->desired_mtu;
+
+    /* Copy the IP header + the first 8 bytes of the IP packet */
+    for (i = 0; i < l3_hdr_len; i++) {
+        packet->icmp_data[i] = p[l3_offset + i];
+    }
+
+    for (i = 0; i < 8; i++) {
+        packet->icmp_data[i + l3_hdr_len] = p[l3_offset + l3_hdr_len + i];
+    }
+    icmp_chksum += add_checksum(packet->icmp_data, l3_hdr_len + 8);
+
+    /* Set the IP packet length */
+    /* ip + icmp + original_ip + 8 bytes of data */
+    packet->ip_length = htons((u_int16_t)36 + (u_int16_t)l3_hdr_len);
+    ip_chksum += ntohs(packet->ip_length);
+
+    /* Compute the ICMP and IP checksums */
+    packet->icmp_chksum = (icmp_chksum >> 16) + (icmp_chksum & 0xffff);
+    packet->icmp_chksum += (packet->icmp_chksum >> 16);
+    packet->icmp_chksum = htons(~packet->icmp_chksum - 4);
+
+    packet->ip_chksum = (ip_chksum >> 16) + (ip_chksum & 0xffff);
+    packet->ip_chksum += (packet->ip_chksum >> 16);
+    packet->ip_chksum = htons(~packet->ip_chksum - 2);
 
 	/* Check if the limits will be reached */
 	int limit_src = hashlimit_check_hash(state->sources, hash, hash_len);
@@ -274,18 +236,22 @@ static int handle_packet(const uint8_t *p, unsigned data_len, void *userdata)
 	hashlimit_subtract_hash(state->sources, hash, hash_len);
 	hashlimit_subtract(state->ifaces, 0);
 
+	u_int8_t *pp;
+	build_packet(packet, &pp, l3_hdr_len + 8, ntohs(packet->ip_length) + 14);
+
 	reason = "transmitting";
 	if (state->verbose > 2) {
-		printf("%s %s mtu=%i sport=%i  %s\n",
-		       ip_to_string(hash, hash_len), reason, mtu_of_next_hop,
-		       l4_sport, to_hex(p, data_len));
+		printf("%s %s mtu=%i sport=%i  data=%s\n",
+		       ip_to_string(hash, hash_len), reason, state->desired_mtu,
+		       l4_sport, to_hex(pp, ntohs(packet->ip_length) + 14));
 	} else if (state->verbose) {
 		printf("%s %s mtu=%i sport=%i\n", ip_to_string(hash, hash_len),
-		       reason, mtu_of_next_hop, l4_sport);
+		       reason, state->desired_mtu, l4_sport);
 	}
 
 	if (state->dry_run == 0) {
-		int r = send(state->raw_sd, pp, data_len, 0);
+		int r = send(state->raw_sd, pp, ntohs(packet->ip_length) + 14, 0);
+        //int r = send(state->raw_sd, p, data_len, 0);
 		/* ENOBUFS happens during IRQ storms okay to ignore */
 		if (r < 0 && errno != ENOBUFS) {
 			PFATAL("send()");
@@ -296,11 +262,11 @@ static int handle_packet(const uint8_t *p, unsigned data_len, void *userdata)
 reject:
 	if (state->verbose > 2) {
 		printf("%s %s mtu=%i sport=%i  %s\n",
-		       ip_to_string(hash, hash_len), reason, mtu_of_next_hop,
+		       ip_to_string(hash, hash_len), reason, state->desired_mtu,
 		       l4_sport, to_hex(p, data_len));
 	} else if (state->verbose > 1) {
 		printf("%s %s mtu=%i sport=%i\n", ip_to_string(hash, hash_len),
-		       reason, mtu_of_next_hop, l4_sport);
+		       reason, state->desired_mtu, l4_sport);
 	}
 
 	return -1;
@@ -339,62 +305,28 @@ static int handle_pcap(struct uevent *uevent, int sfd, int mask, void *userdata)
 	}
 }
 
-static int handle_nflog(struct uevent *uevent, int n_fd, int mask,
-			void *userdata)
-{
-	struct state *state = userdata;
-
-	while (1) {
-		struct nflog *n = state->nflog;
-		uint8_t buf[4096] __attribute__((aligned));
-
-		int r = recv(n_fd, buf, sizeof(buf), 0);
-		if (r < 0) {
-			if (errno == EWOULDBLOCK) {
-				break;
-			} else if (errno == ENOBUFS) {
-				/* Running behind, ignore */
-			} else {
-				PFATAL("recv()");
-			}
-		}
-
-		nflog_go_handle(n, buf, (unsigned)r);
-		if ((unsigned)r < sizeof(buf)) {
-			break;
-		}
-	}
-	return 0;
-}
-
 int main(int argc, char *argv[])
 {
 	static struct option long_options[] = {
 		{"iface", required_argument, 0, 'i'},
-		{"nflog", required_argument, 0, 'n'},
 		{"src-rate", required_argument, 0, 's'},
 		{"iface-rate", required_argument, 0, 'r'},
 		{"verbose", no_argument, 0, 'v'},
 		{"dry-run", no_argument, 0, 'd'},
 		{"cpu", required_argument, 0, 'c'},
 		{"help", no_argument, 0, 'h'},
-		{"ports", required_argument, 0, 'p'},
-		{"strict", no_argument, 0, 't'},
-		{"use-src", no_argument, 0, 'S'},
+		{"desired-mtu", required_argument, 0, 'm'},
 		{NULL, 0, 0, 0}};
 
 	const char *optstring = optstring_from_long_options(long_options);
 	const char *iface = NULL;
-	int nflog_group = -1;
 
 	double src_rate = SRC_RATE_PPS;
 	double iface_rate = IFACE_RATE_PPS;
 	int verbose = 0;
 	int dry_run = 0;
 	int taskset_cpu = -1;
-	uint64_t *ports_map = NULL;
-	int strict = 0;
-	int use_src = 0;
+	int desired_mtu = -1;
 
 	optind = 1;
 	while (1) {
@@ -422,27 +354,11 @@ int main(int argc, char *argv[])
 			iface = optarg;
 			break;
 
-		case 'n':
-			nflog_group = atoi(optarg);
-			if (nflog_group < 0 || nflog_group > 65535) {
-				FATAL("NFLOG group must be within range "
-				      "0..65535");
-			}
-			break;
-
 		case 's':
 			src_rate = atof(optarg);
 			if (src_rate <= 0.0) {
 				FATAL("Rates must be greater than zero");
 			}
-			break;
-
-		case 't':
-			strict = 1;
-			break;
-
-		case 'S':
-			use_src = 1;
 			break;
 
 		case 'r':
@@ -451,29 +367,13 @@ int main(int argc, char *argv[])
 				FATAL("Rates must be greater than zero");
 			}
 			break;
-
-		case 'p': {
-			if (ports_map == NULL) {
-				ports_map = bitmap_alloc(65536);
+		case 'm':
+			desired_mtu = atoi(optarg);
+			if (desired_mtu < 0 || desired_mtu > 65535) {
+				FATAL("MTU must be within range "
+				      "0..65535");
 			}
-			const char **org_ports = parse_argv(optarg, ',');
-			const char **ports = org_ports;
-			for (; ports[0] != NULL; ports++) {
-				errno = 0;
-				char *eptr = NULL;
-				int port = strtol(ports[0], &eptr, 10);
-				if (port < 0 || port > 65535 || errno != 0 ||
-				    (unsigned)(eptr - ports[0]) !=
-					    strlen(ports[0])) {
-					FATAL("Malformed port number value "
-					      "\"%s\".",
-					      ports[0]);
-				}
-				bitmap_set(ports_map, port);
-			}
-			free(org_ports);
 			break;
-		}
 
 		case 'v':
 			verbose++;
@@ -501,6 +401,10 @@ int main(int argc, char *argv[])
 		FATAL("Specify interface with --iface option");
 	}
 
+	if (desired_mtu == -1) {
+        FATAL("Specify desired MTU with --desired-mtu option");
+	}
+
 	if (set_core_dump(1) < 0) {
 		ERRORF("[ ] Failed to enable core dumps, continuing anyway.\n");
 	}
@@ -518,30 +422,25 @@ int main(int argc, char *argv[])
 	state.sources = hashlimit_alloc(8191, src_rate, src_rate * 1.9);
 	state.ifaces = hashlimit_alloc(32, iface_rate, iface_rate * 1.9);
 	state.verbose = verbose;
-	state.strict = strict;
-	state.use_src = use_src;
 	state.dry_run = dry_run;
-	state.ports_map = ports_map;
+	state.desired_mtu = desired_mtu;
 	state.raw_sd = setup_raw(iface);
 
 	struct uevent uevent;
 	uevent_new(&uevent);
 
-	if (nflog_group == -1) {
-		state.pcap = setup_pcap(iface, BPF_FILTER, SNAPLEN, &stats);
-		int pcap_fd = pcap_get_selectable_fd(state.pcap);
-		if (pcap_fd < 0) {
-			PFATAL("pcap_get_selectable_fd()");
-		}
-		uevent_yield(&uevent, pcap_fd, UEVENT_READ, handle_pcap,
-			     &state);
-	} else {
-		state.nflog =
-			nflog_alloc(nflog_group, 128, handle_packet, &state);
-		int nflog_fd = nflog_get_fd(state.nflog);
-		uevent_yield(&uevent, nflog_fd, UEVENT_READ, handle_nflog,
-			     &state);
-	}
+
+    char * filter = (char *)malloc(sizeof(BPF_FILTER) + 3* sizeof(char));
+
+    sprintf(filter, BPF_FILTER, state.desired_mtu);
+    state.pcap = setup_pcap(iface, filter, SNAPLEN, &stats);
+    int pcap_fd = pcap_get_selectable_fd(state.pcap);
+    if (pcap_fd < 0) {
+        PFATAL("pcap_get_selectable_fd()");
+    }
+    uevent_yield(&uevent, pcap_fd, UEVENT_READ, handle_pcap,
+             &state);
+
 
 	volatile int done = 0;
 	uevent_yield(&uevent, signal_desc(SIGINT), UEVENT_READ, on_signal,
@@ -550,12 +449,7 @@ int main(int argc, char *argv[])
 		     (void *)&done);
 
 	fprintf(stderr, "[*] #%i Started pmtud ", getpid());
-	if (nflog_group == -1) {
-		fprintf(stderr, "pcap on iface=%s ", str_quote(iface));
-	} else {
-		fprintf(stderr, "nflog group %i, send iface=%s ", nflog_group,
-			str_quote(iface));
-	}
+	fprintf(stderr, "pcap on iface=%s ", str_quote(iface));
 
 	fprintf(stderr,
 		"rates={iface=%.1f pps source=%.1f pps}, verbose=%i, "
@@ -572,11 +466,7 @@ int main(int argc, char *argv[])
 	}
 	fprintf(stderr, "[*] #%i Quitting\n", getpid());
 
-	if (nflog_group == -1) {
-		unsetup_pcap(state.pcap, iface, &stats);
-	} else {
-		nflog_free(state.nflog);
-	}
+	unsetup_pcap(state.pcap, iface, &stats);
 	fprintf(stderr, "[*] #%i recv=%i drop=%i ifdrop=%i\n", getpid(),
 		stats.ps_recv, stats.ps_drop, stats.ps_ifdrop);
 
@@ -584,9 +474,6 @@ int main(int argc, char *argv[])
 
 	hashlimit_free(state.sources);
 	hashlimit_free(state.ifaces);
-	if (state.ports_map) {
-		bitmap_free(state.ports_map);
-	}
 
 	return 0;
 }

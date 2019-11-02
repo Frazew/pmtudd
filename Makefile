@@ -1,8 +1,9 @@
-CC       ?= clang
+CC       ?= gcc
 LDOPTS   += -Wl,-z,now -Wl,-z,relro -pie
 COPTSWARN = -Wall -Wextra -Wno-unused-parameter -Wpointer-arith -Werror
-COPTSSEC  = -D_FORTIFY_SOURCE=2
+COPTSSEC  = -D_FORTIFY_SOURCE=2 -O2
 
+LIBPCAPOPTS  = --enable-dbus=no --enable-bluetooth=no --enable-usb=no --without-libnl --disable-canusb
 ifeq ($(CC), cc)
 	CC = clang
 endif
@@ -31,13 +32,12 @@ pmtud: libpcap.a libnetfilter_log.a libnfnetlink.a src/*.c src/*.h Makefile
 	$(CC) $(COPTS) \
 		src/main.c src/utils.c src/net.c src/uevent.c \
 		src/hashlimit.c src/csiphash.c src/sched.c \
-		src/bitmap.c src/nflog.c \
-		libpcap.a libnetfilter_log.a libnfnetlink.a \
+		./libpcap.a ./libnetfilter_log.a ./libnfnetlink.a \
 		$(LDOPTS) \
 		-o pmtud
 
 libpcap.a: deps/libpcap
-	(cd deps/libpcap && ./configure && make)
+	(cd deps/libpcap && ./configure $(LIBPCAPOPTS) && make)
 	cp deps/libpcap/libpcap.a .
 
 libnfnetlink.a: deps/libnfnetlink

@@ -3,3 +3,6 @@ pmtud
 core
 tests/venv
 pmtud_*.deb
+.idea
+CMakeLists.txt
+cmake-build-debug
