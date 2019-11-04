@@ -28,11 +28,11 @@ COPTS+=$(CFLAGS) $(COPTSDEBUG) $(COPTSWARN) $(COPTSSEC) -fPIE \
 
 all: pmtudd
 
-pmtudd: libpcap.a libnetfilter_log.a libnfnetlink.a src/*.c src/*.h Makefile
+pmtudd: libpcap.a src/*.c src/*.h Makefile
 	$(CC) $(COPTS) \
 		src/main.c src/utils.c src/net.c src/uevent.c \
 		src/hashlimit.c src/csiphash.c src/sched.c \
-		./libpcap.a ./libnetfilter_log.a ./libnfnetlink.a \
+		./libpcap.a \
 		$(LDOPTS) \
 		-o pmtudd
 
@@ -40,24 +40,12 @@ libpcap.a: deps/libpcap
 	(cd deps/libpcap && ./configure $(LIBPCAPOPTS) && make)
 	cp deps/libpcap/libpcap.a .
 
-libnfnetlink.a: deps/libnfnetlink
-	(cd deps/libnfnetlink && ./autogen.sh && CFLAGS="-fpic" ./configure --enable-static && make)
-	cp deps/libnfnetlink/src/.libs/libnfnetlink.a .
-
-libnetfilter_log.a: deps/libnetfilter_log libnfnetlink.a
-	(cd deps/libnetfilter_log && ./autogen.sh \
-		&& PKG_CONFIG_PATH=$$PWD/../libnfnetlink CFLAGS="-fpic" ./configure --enable-static \
-		&& make CPPFLAGS=-I$$PWD/../libnfnetlink/include LDFLAGS=-L$$PWD/../libnfnetlink/src/.libs)
-	cp deps/libnetfilter_log/src/.libs/libnetfilter_log.a .
-
 clean:
 	rm -rf pmtudd pmtudd_*.deb
 
 distclean: clean
 	rm -f lib*.a
 	-(cd deps/libpcap && make clean && make distclean)
-	-(cd deps/libnfnetlink && make clean && make distclean)
-	-(cd deps/libnetfilter_log && make clean && make distclean)
 
 format:
 	clang-format-3.5 -i src/*.c src/*.h
@@ -66,9 +54,9 @@ format:
 # Release process
 # ---------------
 GITVER       := $(shell git describe --tags --always --dirty=-dev)
-VERSION      := $(shell python -c 'print "$(GITVER)"[1:].partition("-")[0]')
-ITERATION    := $(shell python -c 'print ("$(GITVER)"[1:].partition("-")[2] or "0")')
-NEXT_VERSION := v0.$(shell python -c 'print int("$(GITVER)"[1:].partition("-")[0][2:]) + 1')
+VERSION      := $(shell python2 -c 'print "$(GITVER)"[1:].partition("-")[0]')
+ITERATION    := $(shell python2 -c 'print ("$(GITVER)"[1:].partition("-")[2] or "0")')
+NEXT_VERSION := v0.$(shell python2 -c 'print int("$(GITVER)"[1:].partition("-")[0][2:]) + 1')
 
 .PHONY: release
 
