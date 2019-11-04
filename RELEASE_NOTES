@@ -1,3 +1,18 @@
+v0.7  (20191104-0225)
+- 2016-01-08 Fix #1 - typo: called nflog_unbind_pf instead of nflog_bind_pf
+- 2016-01-20 Only capture incoming packets
+- 2018-09-01 fix --strict option crash
+- 2018-09-10 Merge pull request #7 from kerolasa/crash-fix
+- 2018-09-11 avoid buffer overflow
+- 2018-09-12 Merge pull request #9 from kerolasa/fix-possible-overflow
+- 2018-10-26 Add option to use src MAC of orig pkt as a src of fwd pkt
+- 2018-10-26 Fix help text formatting
+- 2019-05-03 Merge pull request #10 from niku64/ft-use-src-mac
+- 2019-11-02 Repurpose completely the project to fit our needs
+- 2019-11-02 Rename to pmtudd and update README
+- 2019-11-04 Bring bag RELEASE_NOTES
+- 2019-11-04 Remove unneeded dependencies and cleanup Makefile
+
 v0.6  (20150219-1309)
 - 2015-02-18 Tweak csiphash to eliminate misaligned reads
 - 2015-02-18 Split the hashlimit into two parts: update and subtraction
